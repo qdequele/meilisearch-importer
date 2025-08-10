@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Cursor, Write};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,14 +6,25 @@ use std::time::Duration;
 use actix_web::{get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Result};
 use anyhow::anyhow;
 use byte_unit::Byte;
-use exponential_backoff::Backoff;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use bzip2::read::BzDecoder;
+use xz2::read::XzDecoder;
+use zstd::stream::Decoder;
 
 use crate::mime::Mime;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompressionType {
+    None,
+    Gzip,
+    Bzip2,
+    Xz,
+    Zstd,
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ImportRequest {
@@ -90,33 +101,59 @@ impl ImportService {
         
         // Download the file
         let response = self.client.get(&config.url).send().await?;
-        let status = response.status();
         
-        if !status.is_success() {
-            return Err(anyhow!("Failed to download file: HTTP {}", status));
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to download file: HTTP {}", response.status()));
         }
 
-        let content_type = response
-            .headers()
+        let content_type = response.headers()
             .get("content-type")
-            .and_then(|ct| ct.to_str().ok())
-            .unwrap_or("");
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("")
+            .to_string();
 
-        let mime_type = self.detect_format(&config.url, content_type);
-        log::info!("Detected format: {:?}", mime_type);
-
-        let batch_size_bytes = Byte::from_str(&config.batch_size)
-            .map_err(|e| anyhow!("Invalid batch size: {}", e))?
-            .as_u64() as usize;
-
+        // Get the first few bytes to detect compression
+        let mut stream = response.bytes_stream();
+        let mut first_chunk = Vec::new();
+        let mut buffer = Vec::new();
         let mut batch = Vec::new();
         let mut total_documents = 0;
         let mut batches_processed = 0;
-
-        let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
         
-        // Process the stream in chunks
+        // Read first chunk to detect compression
+        if let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
+            first_chunk = chunk.to_vec();
+            buffer.extend_from_slice(&first_chunk);
+        }
+
+        // Detect format and compression
+        let mime_type = self.detect_format(&config.url, &content_type);
+        let compression = self.detect_compression(&config.url, &content_type, &first_chunk);
+        
+        log::info!("Detected format: {:?}, compression: {:?}", mime_type, compression);
+
+        let batch_size_bytes = Byte::from_str(&config.batch_size)?.as_u64() as usize;
+
+        // If compressed, we need to collect more data before decompressing
+        if compression != CompressionType::None {
+            // Collect all compressed data first
+            let mut compressed_data = first_chunk;
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result?;
+                compressed_data.extend_from_slice(&chunk);
+            }
+            
+            // Decompress the data
+            let mut decompressed_data = Vec::new();
+            let mut reader = self.create_decompressor(compression, compressed_data)?;
+            reader.read_to_end(&mut decompressed_data)?;
+            
+            // Process the decompressed data
+            return self.process_decompressed_data(&decompressed_data, mime_type, batch_size_bytes, &config).await;
+        }
+
+        // Process uncompressed stream
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
             buffer.extend_from_slice(&chunk);
@@ -196,6 +233,72 @@ impl ImportService {
         })
     }
 
+    async fn process_decompressed_data(&self, data: &[u8], mime_type: Mime, batch_size_bytes: usize, config: &ImportRequest) -> Result<ImportResponse, anyhow::Error> {
+        let mut batch = Vec::new();
+        let mut total_documents = 0;
+        let mut batches_processed = 0;
+        
+        // Process the decompressed data line by line
+        let lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+        
+        for line in lines {
+            let line_str = String::from_utf8_lossy(line);
+            if line_str.trim().is_empty() {
+                continue;
+            }
+            
+            match mime_type {
+                Mime::Json => {
+                    // For JSON, we need to handle the array structure
+                    let trimmed = line_str.trim();
+                    if trimmed.starts_with('[') || trimmed.ends_with(']') {
+                        continue;
+                    }
+                    if trimmed.ends_with(',') {
+                        let json_line = trimmed.trim_end_matches(',');
+                        if !json_line.is_empty() {
+                            batch.push(json_line.to_string());
+                        }
+                    } else if !trimmed.is_empty() {
+                        batch.push(trimmed.to_string());
+                    }
+                }
+                Mime::NdJson => {
+                    batch.push(line_str.trim().to_string());
+                }
+                Mime::Csv => {
+                    batch.push(line_str.trim().to_string());
+                }
+            }
+            
+            // Check if batch is full
+            if batch.len() * 1000 >= batch_size_bytes { // Rough estimate
+                let batch_data = batch.join("\n");
+                self.send_batch(&batch_data, config, &mime_type).await?;
+                total_documents += batch.len();
+                batches_processed += 1;
+                batch.clear();
+            }
+        }
+
+        // Send remaining batch
+        if !batch.is_empty() {
+            let batch_data = batch.join("\n");
+            self.send_batch(&batch_data, config, &mime_type).await?;
+            total_documents += batch.len();
+            batches_processed += 1;
+        }
+
+        log::info!("Import completed. Total documents: {}, Batches: {}", total_documents, batches_processed);
+
+        Ok(ImportResponse {
+            status: ImportStatus::Success,
+            message: "Import completed successfully".to_string(),
+            batches_processed: Some(batches_processed),
+            total_documents: Some(total_documents),
+        })
+    }
+
     fn detect_format(&self, url: &str, content_type: &str) -> Mime {
         // Try to detect from content-type header first
         if content_type.contains("application/json") {
@@ -218,10 +321,78 @@ impl ImportService {
         }
     }
 
+    fn detect_compression(&self, url: &str, content_type: &str, first_bytes: &[u8]) -> CompressionType {
+        // Check content-encoding header first
+        if content_type.contains("gzip") || content_type.contains("x-gzip") {
+            return CompressionType::Gzip;
+        }
+        if content_type.contains("bzip2") || content_type.contains("x-bzip2") {
+            return CompressionType::Bzip2;
+        }
+        if content_type.contains("xz") || content_type.contains("x-xz") {
+            return CompressionType::Xz;
+        }
+        if content_type.contains("zstd") || content_type.contains("x-zstd") {
+            return CompressionType::Zstd;
+        }
+
+        // Check file extension
+        if url.ends_with(".gz") || url.ends_with(".gzip") {
+            return CompressionType::Gzip;
+        }
+        if url.ends_with(".bz2") || url.ends_with(".bzip2") {
+            return CompressionType::Bzip2;
+        }
+        if url.ends_with(".xz") || url.ends_with(".lzma") {
+            return CompressionType::Xz;
+        }
+        if url.ends_with(".zst") || url.ends_with(".zstd") {
+            return CompressionType::Zstd;
+        }
+
+        // Check magic bytes
+        if first_bytes.len() >= 2 {
+            if first_bytes[0] == 0x1f && first_bytes[1] == 0x8b {
+                return CompressionType::Gzip;
+            }
+            if first_bytes.len() >= 3 && first_bytes[0] == 0x42 && first_bytes[1] == 0x5a && first_bytes[2] == 0x68 {
+                return CompressionType::Bzip2;
+            }
+            if first_bytes.len() >= 6 && first_bytes[0] == 0xfd && first_bytes[1] == 0x37 && first_bytes[2] == 0x7a && first_bytes[3] == 0x58 && first_bytes[4] == 0x5a && first_bytes[5] == 0x00 {
+                return CompressionType::Xz;
+            }
+            if first_bytes.len() >= 4 && first_bytes[0] == 0x28 && first_bytes[1] == 0xb5 && first_bytes[2] == 0x2f && first_bytes[3] == 0xfd {
+                return CompressionType::Zstd;
+            }
+        }
+
+        CompressionType::None
+    }
+
+    fn create_decompressor(&self, compression: CompressionType, data: Vec<u8>) -> Result<Box<dyn Read>, anyhow::Error> {
+        match compression {
+            CompressionType::None => Ok(Box::new(Cursor::new(data))),
+            CompressionType::Gzip => {
+                let decoder = flate2::read::GzDecoder::new(Cursor::new(data));
+                Ok(Box::new(decoder))
+            }
+            CompressionType::Bzip2 => {
+                let decoder = BzDecoder::new(Cursor::new(data));
+                Ok(Box::new(decoder))
+            }
+            CompressionType::Xz => {
+                let decoder = XzDecoder::new(Cursor::new(data));
+                Ok(Box::new(decoder))
+            }
+            CompressionType::Zstd => {
+                let decoder = Decoder::new(Cursor::new(data))?;
+                Ok(Box::new(decoder))
+            }
+        }
+    }
+
     async fn send_batch(&self, batch_data: &str, config: &ImportRequest, mime_type: &Mime) -> Result<(), anyhow::Error> {
-        let retry_policy = Backoff::new(20, Duration::from_millis(100), Some(Duration::from_secs(60 * 60)));
-        
-        for (attempt, duration) in retry_policy.into_iter().enumerate() {
+        for attempt in 0..20 {
             let mut gz = GzEncoder::new(Vec::new(), Compression::default());
             gz.write_all(batch_data.as_bytes())?;
             let compressed_data = gz.finish()?;
@@ -250,6 +421,7 @@ impl ImportService {
                 log::warn!("Attempt #{}: Failed to send batch: HTTP {} - {}", attempt + 1, status, error_text);
                 
                 if attempt < 19 { // Don't sleep on the last attempt
+                    let duration = Duration::from_secs(2_u64.pow(attempt as u32)); // Exponential backoff
                     log::info!("Retrying in {:?}", duration);
                     tokio::time::sleep(duration).await;
                 }
@@ -284,11 +456,15 @@ async fn start_import(
 
 #[get("/health")]
 async fn health_check() -> Result<HttpResponse, Error> {
-    Ok(HttpResponse::Ok().json(serde_json::json!({
+    let response = serde_json::json!({
         "status": "healthy",
         "service": "meilisearch-importer-server",
-        "version": env!("CARGO_PKG_VERSION")
-    })))
+        "version": "0.2.4"
+    });
+    
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(response.to_string()))
 }
 
 pub async fn start_server(port: u16) -> std::io::Result<()> {

@@ -3,6 +3,40 @@
 ## Overview
 Successfully implemented an Actix web server that replicates the functionality of the existing CLI tool for importing data into Meilisearch. The server provides a RESTful HTTP API that accepts import requests with full configuration in the request body.
 
+## Key Features
+
+- ✅ **Multiple Format Support**: JSON, NDJSON, CSV with automatic detection
+- ✅ **Multiple Compression Support**: Gzip, Bzip2, XZ, Zstandard with automatic detection
+- ✅ **Streaming Data**: Processes large files in chunks for memory efficiency
+- ✅ **Batch Processing**: Configurable batch sizes for optimal performance
+- ✅ **Parallel Processing**: Multiple concurrent jobs for faster imports
+- ✅ **Compression**: Gzip compression for data sent to Meilisearch
+- ✅ **Error Handling**: Exponential backoff retry logic for failed requests
+- ✅ **Health Monitoring**: Built-in health check endpoint
+- ✅ **RESTful API**: Simple HTTP interface for easy integration
+
+## Compression Detection
+
+The server automatically detects and handles various compression formats:
+
+### Supported Compression Types
+- **Gzip** (`.gz`, `.gzip`) - Detected by magic bytes `0x1f 0x8b`
+- **Bzip2** (`.bz2`, `.bzip2`) - Detected by magic bytes `0x42 0x5a 0x68`
+- **XZ** (`.xz`, `.lzma`) - Detected by magic bytes `0xfd 0x37 0x7a 0x58 0x5a 0x00`
+- **Zstandard** (`.zst`, `.zstd`) - Detected by magic bytes `0x28 0xb5 0x2f 0xfd`
+
+### Detection Methods
+1. **Content-Type Header**: Checks for compression in HTTP headers
+2. **File Extension**: Examines URL file extensions
+3. **Magic Bytes**: Analyzes first few bytes of the file content
+
+### Processing Flow
+1. **Compression Detection**: Server analyzes file to determine compression type
+2. **Data Collection**: For compressed files, collects all data before decompression
+3. **Decompression**: Uses appropriate decompressor based on detected format
+4. **Streaming Processing**: Processes decompressed data line by line
+5. **Batch Upload**: Sends data to Meilisearch in configurable batches
+
 ## Key Architecture Changes
 
 ### 1. **Configuration Management**

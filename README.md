@@ -4,15 +4,15 @@ A high-performance HTTP server for importing data into Meilisearch instances. Th
 
 ## Features
 
-- 🚀 **High Performance**: Built with Actix Web for maximum throughput
-- 📊 **Multiple Formats**: Supports JSON, NDJSON, and CSV files
-- 🔄 **Streaming**: Processes large files without loading them entirely into memory
-- 📦 **Batch Processing**: Configurable batch sizes for optimal performance
-- ⚡ **Parallel Processing**: Multiple concurrent jobs for faster imports
-- 🗜️ **Compression**: Gzip compression for efficient data transfer
-- 🔁 **Error Handling**: Exponential backoff retry logic for failed requests
-- 🏥 **Health Monitoring**: Built-in health check endpoint
-- 🔒 **Secure**: API key authentication support
+- **Multiple Format Support**: Automatically detects and processes JSON, NDJSON, and CSV files
+- **Multiple Compression Support**: Automatically detects and decompresses Gzip, Bzip2, XZ, and Zstandard files
+- **Streaming Processing**: Efficiently handles large files without loading them entirely into memory
+- **Batch Processing**: Configurable batch sizes for optimal performance
+- **Parallel Processing**: Multiple concurrent jobs for faster imports
+- **Compression**: Gzip compression for data sent to Meilisearch
+- **Error Handling**: Exponential backoff retry logic for failed requests
+- **Health Monitoring**: Built-in health check endpoint
+- **RESTful API**: Simple HTTP interface for easy integration
 
 ## Installation
 
@@ -46,6 +46,23 @@ On CentOS/RHEL:
 ```bash
 sudo yum install openssl-devel pkg-config
 ```
+
+## Compression Support
+
+The server automatically detects and handles various compression formats:
+
+### Supported Compression Types
+- **Gzip** (`.gz`, `.gzip`) - Detected by magic bytes `0x1f 0x8b`
+- **Bzip2** (`.bz2`, `.bzip2`) - Detected by magic bytes `0x42 0x5a 0x68`
+- **XZ** (`.xz`, `.lzma`) - Detected by magic bytes `0xfd 0x37 0x7a 0x58 0x5a 0x00`
+- **Zstandard** (`.zst`, `.zstd`) - Detected by magic bytes `0x28 0xb5 0x2f 0xfd`
+
+### Detection Methods
+1. **Content-Type Header**: Checks for compression in HTTP headers
+2. **File Extension**: Examines URL file extensions
+3. **Magic Bytes**: Analyzes first few bytes of the file content
+
+The server will automatically decompress files before processing, so you can import compressed data files directly without manual decompression.
 
 ## Usage
 
