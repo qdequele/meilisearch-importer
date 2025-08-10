@@ -1,43 +1,35 @@
-use std::io::prelude::*;
+use std::io::Write;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use actix_web::{web, App, Error, HttpResponse, HttpServer, Responder};
-use anyhow::Context;
+use actix_web::{get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Result};
+use anyhow::anyhow;
 use byte_unit::Byte;
 use exponential_backoff::Backoff;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::StreamExt;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::mime::Mime;
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ImportConfig {
-    /// The URL of your Meilisearch instance
+pub struct ImportRequest {
+    pub url: String,
     pub meilisearch_url: String,
-    /// The index name you want to send your documents to
     pub index: String,
-    /// The name of the field that must be used by Meilisearch to uniquely identify your documents
     pub primary_key: Option<String>,
-    /// The API key to access Meilisearch
     pub api_key: Option<String>,
-    /// The delimiter to use for CSV files
     #[serde(default = "default_csv_delimiter")]
     pub csv_delimiter: u8,
-    /// Whether to ignore embeddings
     #[serde(default)]
     pub ignore_embeddings: bool,
-    /// The size of the batches sent to Meilisearch
     #[serde(default = "default_batch_size")]
     pub batch_size: String,
-    /// The number of parallel jobs to use when uploading data
     #[serde(default = "default_jobs")]
     pub jobs: usize,
-    /// The operation to perform when uploading a document
     #[serde(default = "default_upload_operation")]
     pub upload_operation: DocumentOperation,
 }
@@ -51,19 +43,17 @@ pub enum DocumentOperation {
 
 #[derive(Debug, Serialize)]
 pub struct ImportResponse {
-    pub success: bool,
+    pub status: ImportStatus,
     pub message: String,
-    pub total_batches: u64,
-    pub total_documents: u64,
+    pub batches_processed: Option<usize>,
+    pub total_documents: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ImportStatus {
-    pub job_id: String,
-    pub status: String,
-    pub progress: f64,
-    pub total_batches: u64,
-    pub completed_batches: u64,
+#[serde(rename_all = "lowercase")]
+pub enum ImportStatus {
+    Success,
+    Error,
 }
 
 fn default_csv_delimiter() -> u8 {
@@ -71,239 +61,248 @@ fn default_csv_delimiter() -> u8 {
 }
 
 fn default_batch_size() -> String {
-    "20 MiB".to_string()
+    "1 MiB".to_string()
 }
 
 fn default_jobs() -> usize {
-    1
+    2
 }
 
 fn default_upload_operation() -> DocumentOperation {
     DocumentOperation::AddOrReplace
 }
 
-impl ImportConfig {
-    fn batch_size_bytes(&self) -> anyhow::Result<Byte> {
-        self.batch_size.parse().context("Invalid batch size format")
-    }
-}
-
 pub struct ImportService {
-    config: ImportConfig,
     client: Client,
-    thread_pool: ThreadPool,
 }
 
 impl ImportService {
-    pub fn new(config: ImportConfig) -> anyhow::Result<Self> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+    pub fn new() -> Self {
+        let client = Client::new();
         
-        let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(config.jobs)
-            .build()?;
-
-        Ok(Self {
-            config,
+        Self {
             client,
-            thread_pool,
-        })
+        }
     }
 
-    pub async fn import_from_url(&self, url: String) -> anyhow::Result<ImportResponse> {
-        // Download the file from the URL
-        let response = self.client.get(&url).send().await?;
+    pub async fn import_from_url(&self, config: ImportRequest) -> Result<ImportResponse, anyhow::Error> {
+        log::info!("Starting import from URL: {}", config.url);
+        
+        // Download the file
+        let response = self.client.get(&config.url).send().await?;
+        let status = response.status();
+        
+        if !status.is_success() {
+            return Err(anyhow!("Failed to download file: HTTP {}", status));
+        }
+
         let content_type = response
             .headers()
             .get("content-type")
-            .and_then(|v| v.to_str().ok())
+            .and_then(|ct| ct.to_str().ok())
             .unwrap_or("");
 
-        // Determine the format based on content type or URL extension
-        let mime = self.detect_format(&url, content_type)?;
-        
-        // Stream the response body
+        let mime_type = self.detect_format(&config.url, content_type);
+        log::info!("Detected format: {:?}", mime_type);
+
+        let batch_size_bytes = Byte::from_str(&config.batch_size)
+            .map_err(|e| anyhow!("Invalid batch size: {}", e))?
+            .as_u64() as usize;
+
+        let mut batch = Vec::new();
+        let mut total_documents = 0;
+        let mut batches_processed = 0;
+
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
-        let mut total_batches = 0u64;
-        let mut total_documents = 0u64;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        
+        // Process the stream in chunks
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result?;
             buffer.extend_from_slice(&chunk);
-
-            // Process in batches
-            if buffer.len() >= self.config.batch_size_bytes()?.as_u64() as usize {
-                let batch_data = buffer.drain(..).collect::<Vec<_>>();
-                self.send_batch(&mime, &batch_data).await?;
-                total_batches += 1;
-                total_documents += self.count_documents_in_batch(&mime, &batch_data)?;
+            
+            // Process buffer line by line
+            let lines: Vec<&[u8]> = buffer.split(|&b| b == b'\n').collect();
+            
+            if lines.len() <= 1 {
+                // Only one line (potentially incomplete), keep it in buffer
+                continue;
+            }
+            
+            // Process all complete lines except the last one
+            for line in &lines[..lines.len()-1] {
+                let line_str = String::from_utf8_lossy(line);
+                if line_str.trim().is_empty() {
+                    continue;
+                }
+                
+                match mime_type {
+                    Mime::Json => {
+                        // For JSON, we need to handle the array structure
+                        let trimmed = line_str.trim();
+                        if trimmed.starts_with('[') || trimmed.ends_with(']') {
+                            continue;
+                        }
+                        if trimmed.ends_with(',') {
+                            let json_line = trimmed.trim_end_matches(',');
+                            if !json_line.is_empty() {
+                                batch.push(json_line.to_string());
+                            }
+                        } else if !trimmed.is_empty() {
+                            batch.push(trimmed.to_string());
+                        }
+                    }
+                    Mime::NdJson => {
+                        batch.push(line_str.trim().to_string());
+                    }
+                    Mime::Csv => {
+                        batch.push(line_str.trim().to_string());
+                    }
+                }
+                
+                // Check if batch is full
+                if batch.len() * 1000 >= batch_size_bytes { // Rough estimate
+                    let batch_data = batch.join("\n");
+                    self.send_batch(&batch_data, &config, &mime_type).await?;
+                    total_documents += batch.len();
+                    batches_processed += 1;
+                    batch.clear();
+                }
+            }
+            
+            // Keep the last (potentially incomplete) line in buffer
+            if let Some(last_line) = lines.last() {
+                buffer = last_line.to_vec();
+            } else {
+                buffer.clear();
             }
         }
 
-        // Send remaining data
-        if !buffer.is_empty() {
-            self.send_batch(&mime, &buffer).await?;
-            total_batches += 1;
-            total_documents += self.count_documents_in_batch(&mime, &buffer)?;
+        // Send remaining batch
+        if !batch.is_empty() {
+            let batch_data = batch.join("\n");
+            self.send_batch(&batch_data, &config, &mime_type).await?;
+            total_documents += batch.len();
+            batches_processed += 1;
         }
 
+        log::info!("Import completed. Total documents: {}, Batches: {}", total_documents, batches_processed);
+
         Ok(ImportResponse {
-            success: true,
+            status: ImportStatus::Success,
             message: "Import completed successfully".to_string(),
-            total_batches,
-            total_documents,
+            batches_processed: Some(batches_processed),
+            total_documents: Some(total_documents),
         })
     }
 
-    fn detect_format(&self, url: &str, content_type: &str) -> anyhow::Result<Mime> {
-        // Try to detect from content type first
-        if content_type.contains("json") {
-            if content_type.contains("ndjson") || content_type.contains("jsonl") {
-                return Ok(Mime::NdJson);
-            }
-            return Ok(Mime::Json);
-        } else if content_type.contains("csv") {
-            return Ok(Mime::Csv);
+    fn detect_format(&self, url: &str, content_type: &str) -> Mime {
+        // Try to detect from content-type header first
+        if content_type.contains("application/json") {
+            return Mime::Json;
+        }
+        if content_type.contains("text/csv") {
+            return Mime::Csv;
         }
 
         // Fall back to URL extension
-        if let Some(mime) = Mime::from_path(std::path::Path::new(url)) {
-            return Ok(mime);
+        if url.ends_with(".json") {
+            Mime::Json
+        } else if url.ends_with(".ndjson") || url.ends_with(".jsonl") {
+            Mime::NdJson
+        } else if url.ends_with(".csv") {
+            Mime::Csv
+        } else {
+            // Default to JSON
+            Mime::Json
         }
-
-        anyhow::bail!("Could not determine file format from URL or content type")
     }
 
-    async fn send_batch(&self, mime: &Mime, data: &[u8]) -> anyhow::Result<()> {
-        let api_key = self.config.api_key.clone();
-        let mut url = format!("{}/indexes/{}/documents", self.config.meilisearch_url, self.config.index);
+    async fn send_batch(&self, batch_data: &str, config: &ImportRequest, mime_type: &Mime) -> Result<(), anyhow::Error> {
+        let retry_policy = Backoff::new(20, Duration::from_millis(100), Some(Duration::from_secs(60 * 60)));
         
-        if let Some(primary_key) = &self.config.primary_key {
-            url = format!("{}?primaryKey={}", url, primary_key);
-        }
+        for (attempt, duration) in retry_policy.into_iter().enumerate() {
+            let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+            gz.write_all(batch_data.as_bytes())?;
+            let compressed_data = gz.finish()?;
 
-        // Compress the data
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(data)?;
-        let compressed_data = encoder.finish()?;
+            let mut request_builder = self.client
+                .post(&format!("{}/indexes/{}/documents", config.meilisearch_url, config.index))
+                .header("Content-Type", mime_type.as_str())
+                .header("Content-Encoding", "gzip");
 
-        let retries = 20;
-        let min = Duration::from_millis(100);
-        let max = Duration::from_secs(60 * 60);
-        let backoff = Backoff::new(retries, min, max);
-
-        for (attempt, duration) in backoff.into_iter().enumerate() {
-            let mut request = self.client.request(
-                match self.config.upload_operation {
-                    DocumentOperation::AddOrReplace => reqwest::Method::POST,
-                    DocumentOperation::AddOrUpdate => reqwest::Method::PUT,
-                },
-                &url,
-            );
-
-            request = request
-                .header("Content-Type", mime.as_str())
-                .header("Content-Encoding", "gzip")
-                .header("X-Meilisearch-Client", "Meilisearch Importer Server");
-
-            if let Some(api_key) = &api_key {
-                request = request.header("Authorization", &format!("Bearer {}", api_key));
+            if let Some(ref api_key) = config.api_key {
+                request_builder = request_builder.header("Authorization", &format!("Bearer {}", api_key));
             }
+            
+            let response = request_builder
+                .body(compressed_data)
+                .send()
+                .await?;
 
-            match request.body(compressed_data.clone()).send().await {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) => {
-                    let status = response.status();
-                    let error_text = response.text().await.unwrap_or_default();
-                    log::warn!("Attempt #{}: HTTP {} - {}", attempt + 1, status, error_text);
-                    tokio::time::sleep(duration).await;
-                }
-                Err(e) => {
-                    log::warn!("Attempt #{}: {}", attempt + 1, e);
+            let status = response.status();
+            
+            if status.is_success() {
+                log::info!("Batch sent successfully");
+                return Ok(());
+            } else {
+                let error_text = response.text().await.unwrap_or_default();
+                log::warn!("Attempt #{}: Failed to send batch: HTTP {} - {}", attempt + 1, status, error_text);
+                
+                if attempt < 19 { // Don't sleep on the last attempt
+                    log::info!("Retrying in {:?}", duration);
                     tokio::time::sleep(duration).await;
                 }
             }
         }
 
-        anyhow::bail!("Too many errors. Stopping the retries.")
-    }
-
-    fn count_documents_in_batch(&self, mime: &Mime, data: &[u8]) -> anyhow::Result<u64> {
-        match mime {
-            Mime::Json => {
-                // For JSON, count the number of objects in the array
-                let text = String::from_utf8_lossy(data);
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(array) = json.as_array() {
-                        return Ok(array.len() as u64);
-                    }
-                }
-                Ok(1) // Single JSON object
-            }
-            Mime::NdJson => {
-                // For NDJSON, count the number of lines
-                let text = String::from_utf8_lossy(data);
-                Ok(text.lines().filter(|line| !line.trim().is_empty()).count() as u64)
-            }
-            Mime::Csv => {
-                // For CSV, count the number of lines minus header
-                let text = String::from_utf8_lossy(data);
-                let lines: Vec<&str> = text.lines().collect();
-                if lines.len() > 1 {
-                    Ok((lines.len() - 1) as u64)
-                } else {
-                    Ok(0)
-                }
-            }
-        }
+        Err(anyhow!("Failed to send batch after all retries"))
     }
 }
 
-pub async fn start_import(
-    config: web::Json<ImportConfig>,
-    url: web::Json<serde_json::Value>,
-) -> Result<impl Responder, Error> {
-    let url = url["url"]
-        .as_str()
-        .ok_or_else(|| actix_web::error::ErrorBadRequest("Missing 'url' field"))?;
-
-    let import_service = ImportService::new(config.into_inner())
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-
-    let result = import_service.import_from_url(url.to_string()).await;
+#[post("/import")]
+async fn start_import(
+    _req: HttpRequest,
+    payload: web::Json<ImportRequest>,
+    service: web::Data<Arc<ImportService>>,
+) -> Result<HttpResponse, Error> {
+    log::info!("Received import request for URL: {}", payload.url);
     
-    match result {
+    match service.import_from_url(payload.into_inner()).await {
         Ok(response) => Ok(HttpResponse::Ok().json(response)),
-        Err(e) => Ok(HttpResponse::InternalServerError().json(ImportResponse {
-            success: false,
-            message: format!("Import failed: {}", e),
-            total_batches: 0,
-            total_documents: 0,
-        })),
+        Err(e) => {
+            log::error!("Import failed: {}", e);
+            Ok(HttpResponse::InternalServerError().json(ImportResponse {
+                status: ImportStatus::Error,
+                message: format!("Import failed: {}", e),
+                batches_processed: None,
+                total_documents: None,
+            }))
+        }
     }
 }
 
-pub async fn health_check() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
+#[get("/health")]
+async fn health_check() -> Result<HttpResponse, Error> {
+    Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": "healthy",
-        "service": "meilisearch-importer-server"
-    }))
+        "service": "meilisearch-importer-server",
+        "version": env!("CARGO_PKG_VERSION")
+    })))
 }
 
-pub async fn start_server(config: ImportConfig, port: u16) -> anyhow::Result<()> {
-    let config = Arc::new(config);
+pub async fn start_server(port: u16) -> std::io::Result<()> {
+    let service = Arc::new(ImportService::new());
+    
+    log::info!("Starting Meilisearch Importer Server on port {}", port);
     
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(config.clone()))
-            .route("/health", web::get().to(health_check))
-            .route("/import", web::post().to(start_import))
+            .app_data(web::Data::new(service.clone()))
+            .service(start_import)
+            .service(health_check)
     })
     .bind(("127.0.0.1", port))?
     .run()
-    .await?;
-
-    Ok(())
+    .await
 }
